@@ -1,8 +1,7 @@
-import { currentAnalysisPermit } from './analysis-permit-context';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { fromPrisma, type PgBoss } from 'pg-boss';
 import { formatInTimeZone } from 'date-fns-tz';
+import { fromPrisma, type PgBoss } from 'pg-boss';
 import prisma, { getRawQueryClient } from '@/lib/prisma';
 import type {
   GeoWeightResponse,
@@ -11,23 +10,24 @@ import type {
 } from '../contracts/geo-weight';
 import {
   GEO_SNAPSHOT_FORMAT,
-  geoWeightSnapshotQuerySchema,
   geoWeightRecalculateSchema,
   geoWeightResponseSchema,
+  geoWeightSnapshotQuerySchema,
 } from '../contracts/geo-weight';
 import { GEO_ALGORITHM } from '../geo-weight/policy';
 import { canonicalGeoTimezone, geoDateOffset, geoWindow } from '../geo-weight/window';
 import { getQueue } from '../log-ingestion/queue';
-import { aiExecutor, type AiTx } from './ai-db';
+import { type AiTx, aiExecutor } from './ai-db';
+import { currentAnalysisPermit } from './analysis-permit-context';
+import { noteCacheResult } from './cache-context';
 import { authorizeCrawler, type CrawlerActor } from './crawler-access';
+import { LiekanError } from './errors';
 import {
   calculateGeoWeight,
   GEO_SCOPE_HASH,
   GeoWeightLockBusy,
   parseGeoWeightQuery,
 } from './geo-weight';
-import { LiekanError } from './errors';
-import { noteCacheResult } from './cache-context';
 
 export const GEO_SNAPSHOT_QUEUE = 'liekan-geo-weight-snapshot';
 export const GEO_SNAPSHOT_LIMITS = Object.freeze({
@@ -631,7 +631,18 @@ export async function readGeoWeightSnapshot(
       tier: 'database' as any,
     });
   }
+  if (process.env.VERCEL === '1' && ['queued', 'running'].includes(response.taskStatus)) {
+    const { continueGeoSnapshot } = await import('./inline-workers');
+    continueGeoSnapshot();
+  }
   return response;
+}
+export async function releaseExpiredGeoLeases() {
+  await transaction(async tx => {
+    await tx.execute(
+      `UPDATE liekan_geo_weight_head SET task_status=CASE WHEN attempts>=3 THEN 'failed' ELSE 'queued' END,lease_owner=NULL,lease_until=NULL,next_retry_at=CASE WHEN attempts>=3 THEN NULL WHEN attempts<=1 THEN now()+interval '60 seconds' ELSE now()+interval '300 seconds' END,error_code='worker_lease_expired',completed_at=CASE WHEN attempts>=3 THEN now() ELSE completed_at END WHERE task_status='running' AND lease_until<now()`,
+    );
+  });
 }
 export async function recalculateGeoWeight(actor: CrawlerActor, websiteId: string, input: unknown) {
   const parsed = geoWeightRecalculateSchema.safeParse(input);
@@ -640,6 +651,10 @@ export async function recalculateGeoWeight(actor: CrawlerActor, websiteId: strin
   const p = parseGeoSnapshotQuery({ ...query, view: 'detail' });
   const head = await register(actor, websiteId, p, { requestId });
   const state = await inspect(actor, websiteId, head.id ? { ...p, taskId: head.id } : p);
+  if (process.env.VERCEL === '1') {
+    const { continueGeoSnapshot } = await import('./inline-workers');
+    continueGeoSnapshot();
+  }
   return envelope(
     p,
     state.access,
@@ -812,9 +827,18 @@ export async function processGeoSnapshotJob(_job: GeoSnapshotJob, boss: PgBoss) 
     if (bytes > GEO_SNAPSHOT_LIMITS.resultBytes)
       throw Object.assign(new Error('Result exceeds snapshot limit'), { code: 'result_too_large' });
     await transaction(async tx => {
-      const permit=currentAnalysisPermit();
-      if(permit && !(await tx.query(`SELECT id FROM liekan_analysis_background_lease WHERE id AND token=$1::uuid AND epoch=$2::bigint AND lease_until>clock_timestamp() FOR SHARE`,permit.token,permit.epoch)).length)
-        throw new LiekanError('GEO 权重后台名额已失效',499);
+      const permit = currentAnalysisPermit();
+      if (
+        permit &&
+        !(
+          await tx.query(
+            `SELECT id FROM liekan_analysis_background_lease WHERE id AND token=$1::uuid AND epoch=$2::bigint AND lease_until>clock_timestamp() FOR SHARE`,
+            permit.token,
+            permit.epoch,
+          )
+        ).length
+      )
+        throw new LiekanError('GEO 权重后台名额已失效', 499);
       // Website lifecycle operations acquire this lock before touching GEO heads.
       await geoSnapshotAccess(tx, actor, head.website_id, head.timezone, head.as_of);
       await siteLock(tx, head.website_id);

@@ -1,14 +1,13 @@
-import { collectionRepairScope } from '../upstream/history-repair-boundary';
-import { applyTrustedEdgeIdentity } from '../crawlers/request-verification';
-import { withPublishedRegistry } from '../upstream/crawler-registry-context';
-import { getPublishedCatalog } from '../crawlers/published';
-import { applyEdgeCapabilities } from './edge-observation';
-import { samplingAtReceipt } from './measurement';
-import { normalizeAutomaticWithGeography, persistLogGeography } from '../upstream/log-geography';
-import { randomUUID, createHmac, createHash } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { logPublicOrigin } from '../contracts/installation';
+import { healthSchema } from '../contracts/log-sources';
+import { getPublishedCatalog } from '../crawlers/published';
+import { applyTrustedEdgeIdentity } from '../crawlers/request-verification';
 import { getSettings } from '../store';
+import { withPublishedRegistry } from '../upstream/crawler-registry-context';
+import { collectionRepairScope } from '../upstream/history-repair-boundary';
+import { normalizeAutomaticWithGeography, persistLogGeography } from '../upstream/log-geography';
 import { invalidateWebsiteAnalytics } from '../upstream/query-cache';
 import {
   LiekanError,
@@ -18,19 +17,23 @@ import {
   type WriteIdentity,
 } from '../upstream/server';
 import {
+  archiveCrawlerRules,
+  crawlerClassificationVersion,
+  persistCrawlerEvidence,
+} from './crawler-evidence';
+import { recordCrawlerCoverage } from './crawler-quality';
+import { applyEdgeCapabilities } from './edge-observation';
+import { samplingAtReceipt } from './measurement';
+import {
+  type AutomaticRecord,
   decodeUpload,
   hostname,
   normalizeAutomatic,
   stableUuid,
-  type AutomaticRecord,
 } from './protocol';
 import { enqueue, LOG_QUEUE, PROVIDER_QUEUE } from './queue';
 import { verificationSnapshots } from './ranges';
 import { newToken, tokenHash } from './secrets';
-import { healthSchema } from '../contracts/log-sources';
-import { recordCrawlerCoverage } from './crawler-quality';
-import { crawlerClassificationVersion, archiveCrawlerRules } from './crawler-evidence';
-import { persistCrawlerEvidence } from './crawler-evidence';
 
 export interface LogSource {
   id: string;
@@ -177,7 +180,7 @@ export async function listSources(websiteId: string) {
     (SELECT count(*)::int FROM liekan_ingest_batch b WHERE b.source_id=s.id AND b.state='pending') AS backlog,
     (SELECT count(*)::int FROM liekan_ingest_batch b WHERE b.source_id=s.id AND b.state='failed') AS failed,
     EXISTS(SELECT 1 FROM liekan_log_interval i WHERE i.source_id=s.id AND i.ends_at IS NULL) AS primary,
-    (s.provider_config IS NOT NULL AND (s.state='disconnected' OR s.credential_hash IS NULL)) AS \"cleanupPending\"
+    (s.provider_config IS NOT NULL AND (s.state='disconnected' OR s.credential_hash IS NULL)) AS "cleanupPending"
     FROM liekan_log_source s WHERE website_id=$1::uuid AND (state!='disconnected' OR provider_config IS NOT NULL) ORDER BY created_at DESC`,
     websiteId,
   );
@@ -256,7 +259,8 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
           live.source.health?.fieldCapabilities,
         );
     if (principal.source.provider_job_id === live.source.provider_job_id)
-      for (const record of parsed.records) applyTrustedEdgeIdentity(record, live.source, settings.crawlerRules);
+      for (const record of parsed.records)
+        applyTrustedEdgeIdentity(record, live.source, settings.crawlerRules);
     const old = (
       await tx.$queryRawUnsafe(
         'SELECT id,digest,valid,rejected,state,inserted,duplicates FROM liekan_ingest_batch WHERE id=$1::uuid',
@@ -322,9 +326,13 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
       rejected,
       JSON.stringify(parsed.errors),
       getPublishedCatalog()?.version ?? null,
-      await collectionRepairScope(tx,live.source.website_id),
+      await collectionRepairScope(tx, live.source.website_id),
     );
     await enqueue(tx, LOG_QUEUE, { batchId }, batchId);
+    if (process.env.VERCEL === '1') {
+      const { continueLogBatch } = await import('../upstream/inline-workers');
+      continueLogBatch(batchId);
+    }
     if (valid.length)
       await tx.$executeRawUnsafe(
         'UPDATE liekan_log_source SET last_received_at=now() WHERE id=$1::uuid',

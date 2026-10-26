@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import type { requestAnalysisQuery } from './analysis-queries';
+import { analysisQueryParameters } from './analysis-query-model';
 import { noteCacheResult } from './cache-context';
 import { LiekanError } from './errors';
-import { analysisQueryParameters } from './analysis-query-model';
+import { continueAnalysisQuery } from './inline-workers';
 import { processSingleton } from './process-singleton';
 
 const handoffs = processSingleton(
@@ -10,6 +11,7 @@ const handoffs = processSingleton(
   () => new Map<string, Promise<void>>(),
 );
 async function earlyHandoff(id: string) {
+  continueAnalysisQuery(id);
   let pending = handoffs.get(id);
   if (!pending && handoffs.size < 64) {
     pending = (async () => {
@@ -115,6 +117,7 @@ export async function analysisJobResponse(
   const actor = await authenticateCrawlerMaintenance(request);
   const access = await authorize(request, websiteId);
   const data = await readAnalysisQuery(access.website.id, actor, jobId, result);
+  if (!data.ready) continueAnalysisQuery(jobId);
   if (!result) return Response.json(data, { headers: { 'Cache-Control': 'private, no-store' } });
   return analysisResponse(data);
 }

@@ -1,38 +1,38 @@
 import { randomUUID } from 'node:crypto';
+import type { JobAttempt, PgBoss } from 'pg-boss';
 import { hasPermission } from '@/lib/auth';
 import { PERMISSIONS, ROLES } from '@/lib/constants';
-import type { JobAttempt, PgBoss } from 'pg-boss';
 import type { AnalysisJob } from '../contracts/analysis-acceleration';
+import { pageReportParts } from '../contracts/page-report';
 import { getPublishedCatalog } from '../crawlers/published';
-import { withPublishedRegistry } from './crawler-registry-context';
-import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
 import { aiExecutor } from './ai-db';
-import { authorizeCrawler, type CrawlerActor } from './crawler-access';
+import { withAnalysisPermit } from './analysis-background';
+import { analysisPermitTable } from './analysis-permit-context';
+import {
+  ANALYSIS_QUERY_QUEUE,
+  ANALYSIS_RESULT_FORMAT,
+  analysisDigest,
+  analysisQueryLimits,
+  analysisQueryParameters,
+  analysisResultFresh,
+  decodeAnalysisEnvelope,
+  encodeAnalysisEnvelope,
+  liveAnalysisTargets,
+} from './analysis-query-model';
+import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
 import { readAnalyticsVersions } from './analytics-revision';
-import { websiteCacheTag } from './query-cache';
 import {
   analyticsWorkerContext,
   captureBrowserPopulations,
   currentCacheContext,
   noteBrowserPopulation,
 } from './cache-context';
-import { withAnalysisPermit } from './analysis-background';
-import { analysisPermitTable } from './analysis-permit-context';
-import { pauseIdleDashboardRetries } from './dashboard-demand';
-import {
-  analysisDigest,
-  decodeAnalysisEnvelope,
-  encodeAnalysisEnvelope,
-  analysisQueryParameters,
-  analysisResultFresh,
-  analysisQueryLimits,
-  ANALYSIS_QUERY_QUEUE,
-  ANALYSIS_RESULT_FORMAT,
-  liveAnalysisTargets,
-} from './analysis-query-model';
 import { statisticsCacheTtl } from './cache-policy';
-import { pageReportParts } from '../contracts/page-report';
+import { authorizeCrawler, type CrawlerActor } from './crawler-access';
+import { withPublishedRegistry } from './crawler-registry-context';
+import { pauseIdleDashboardRetries } from './dashboard-demand';
 import { LiekanError } from './errors';
+import { websiteCacheTag } from './query-cache';
 
 type Row = {
   id: string;
@@ -368,10 +368,15 @@ export async function readAnalysisQuery(
     return { ready: false as const, analysisJob: analysisJobDto(row) };
   });
 }
+export async function releaseExpiredAnalysisLeases() {
+  await analysisTransaction(tx =>
+    tx.$executeRawUnsafe(`UPDATE liekan_analysis_query SET status=CASE WHEN attempts>=4 THEN 'failed' ELSE 'queued' END,error_code='analysis-lease-expired',lease_token=NULL,lease_until=NULL
+     WHERE status='running' AND lease_until<=clock_timestamp()`),
+  );
+}
 export async function pumpAnalysisQueries(boss: Pick<PgBoss, 'send' | 'update'>) {
+  await releaseExpiredAnalysisLeases();
   const rows = await analysisTransaction(async tx => {
-    await tx.$executeRawUnsafe(`UPDATE liekan_analysis_query SET status=CASE WHEN attempts>=4 THEN 'failed' ELSE 'queued' END,error_code='analysis-lease-expired',lease_token=NULL,lease_until=NULL
-     WHERE status='running' AND lease_until<=clock_timestamp()`);
     await pauseIdleDashboardRetries(tx);
     await tx.$executeRawUnsafe(
       `DELETE FROM liekan_analysis_query WHERE retention_until<=clock_timestamp()`,
